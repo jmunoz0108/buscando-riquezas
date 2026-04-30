@@ -72,25 +72,25 @@ class ProReversalEngine:
             atr_d  = self._atr(d["high"], d["low"], d["close"], 14)
 
             # ── BULL REVERSAL ──
-            if drop_from_high >= 20:
+            if drop_from_high >= 10:
                 bull = self._score_bull_reversal(
                     price, chg24, vol24, vol_avg, drop_from_high,
                     d, h1, h4, m5, rsi_d, rsi_h1, rsi_h4, rsi_m5,
                     macd_d, macd_h1, atr_d, funding_rate, open_interest, prev_oi
                 )
-                if bull["probability"] >= 55:
+                if bull["probability"] >= 38:
                     return self._build_result(symbol, price, chg24, vol24, vol_avg,
                                               drop_from_high, rise_from_low, rsi_d,
                                               "BULL_REVERSAL", bull, atr_d)
 
             # ── BEAR REVERSAL ──
-            if rise_from_low >= 30:
+            if rise_from_low >= 20:
                 bear = self._score_bear_reversal(
                     price, chg24, vol24, vol_avg, rise_from_low,
                     d, h1, h4, m5, rsi_d, rsi_h1, rsi_h4, rsi_m5,
                     macd_d, macd_h1, atr_d, funding_rate, open_interest, prev_oi
                 )
-                if bear["probability"] >= 55:
+                if bear["probability"] >= 38:
                     return self._build_result(symbol, price, chg24, vol24, vol_avg,
                                               drop_from_high, rise_from_low, rsi_d,
                                               "BEAR_REVERSAL", bear, atr_d)
@@ -241,9 +241,16 @@ class ProReversalEngine:
                 signals.append("RSI Extreme Oversold Recovery")
                 reasons.append(f"🔋 RSI hit extreme oversold ({rsi_min:.0f}) and now recovering — historically 80%+ reversal rate")
             elif rsi_d[-1] < 35 and rsi_d[-1] > rsi_d[-3]:
-                points += 5
+                points += 6
                 signals.append("RSI Oversold Recovery")
                 reasons.append(f"🔋 RSI oversold ({rsi_d[-1]:.0f}) turning up — buyers stepping in")
+            elif rsi_d[-1] < 45 and rsi_d[-1] > rsi_d[-2]:
+                points += 4
+                signals.append("RSI Rising From Low")
+                reasons.append(f"🔋 RSI ({rsi_d[-1]:.0f}) recovering — momentum building")
+            elif rsi_d[-1] < 55 and rsi_d[-1] > rsi_d[-3]:
+                points += 2
+                reasons.append(f"📊 RSI ({rsi_d[-1]:.0f}) trending up")
 
         # ══ SIGNAL 7: MULTI-TF CONFLUENCE (8 pts) ══
         max_pts += 8
@@ -274,12 +281,26 @@ class ProReversalEngine:
             signals.append("Massive Buy Volume")
             reasons.append(f"💰 {vol_r:.1f}x normal volume on positive day — institutional accumulation")
         elif vol_r >= 2.0 and chg24 > 0:
-            points += 5
+            points += 6
             signals.append("Strong Buy Volume")
             reasons.append(f"💰 {vol_r:.1f}x volume surge with price recovery — genuine buying interest")
         elif vol_r >= 1.5:
-            points += 3
-            reasons.append(f"📊 Volume above average ({vol_r:.1f}x)")
+            points += 4
+            reasons.append(f"📊 Volume {vol_r:.1f}x above average — buying interest")
+        elif vol_r >= 1.0:
+            points += 2
+            reasons.append(f"📊 Normal volume ({vol_r:.1f}x) — steady participation")
+
+        # ══ SIGNAL 8b: POSITIVE DAY BONUS ══
+        if chg24 >= 8:
+            points += 6
+            reasons.append(f"📈 Strong +{chg24:.1f}% today — reversal momentum confirmed")
+        elif chg24 >= 3:
+            points += 4
+            reasons.append(f"📈 Up {chg24:.1f}% today — recovery underway")
+        elif chg24 >= 1:
+            points += 2
+            reasons.append(f"📈 Small gain today (+{chg24:.1f}%) — stabilizing")
 
         # ══ SIGNAL 9: PRICE STRUCTURE (7 pts) ══
         max_pts += 7
@@ -303,8 +324,14 @@ class ProReversalEngine:
             points += 4
             reasons.append(f"📉 Down {drop:.0f}% from high — extreme oversold on macro scale")
         elif drop >= 30:
-            points += 2
+            points += 3
             reasons.append(f"📉 Down {drop:.0f}% from high — significant correction")
+        elif drop >= 20:
+            points += 2
+            reasons.append(f"📉 Down {drop:.0f}% from high — pulled back from high")
+        elif drop >= 10:
+            points += 1
+            reasons.append(f"📉 Down {drop:.0f}% from recent high")
 
         # ══ BONUS: FUNDING RATE NEGATIVE (extra squeeze fuel) ══
         if funding_rate < -0.05:
