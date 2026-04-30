@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, Response
+from flask import Flask, jsonify, Response, request
 from reversal_pro import ProReversalEngine
 from scanner_pro import ProScanner
 from news import NewsScanner
@@ -119,6 +119,112 @@ def api_status():
         "telegram":   telegram.enabled,
         "history":    scan_history,
     })
+
+
+# ── ALERT DEDUP — prevent same coin spamming every 30s ──
+sent_browser_alerts = {}  # symbol -> timestamp
+
+@app.route("/api/alert", methods=["POST"])
+def api_alert():
+    """
+    Called by the dashboard when it finds a high-confidence reversal.
+    Forwards to Telegram with dedup (max 1 alert per coin per hour).
+    """
+    try:
+        data = request.get_json(force=True)
+        if not data:
+            return jsonify({"status": "error", "msg": "no data"}), 400
+
+        symbol   = data.get("symbol", "")
+        signal   = data.get("signal", "")
+        prob     = data.get("probability", 0)
+        price    = data.get("price", 0)
+        chg      = data.get("change_24h", 0)
+        reasons  = data.get("reasons", [])
+        targets  = data.get("targets", {})
+        stop     = data.get("stop_loss", "")
+        entry    = data.get("entry_zone", "")
+        rsi      = data.get("rsi_daily", 50)
+        vol      = data.get("volume_ratio", 1)
+        bp       = data.get("buy_pressure", 50)
+        sigs     = data.get("signals_hit", [])
+        grade    = data.get("grade", "")
+        drop     = data.get("drop_from_high", 0)
+        rise     = data.get("rise_from_low", 0)
+
+        if not symbol or not signal or prob < 45:
+            return jsonify({"status": "skipped", "msg": "below threshold"})
+
+        # Dedup — only alert same coin once per hour
+        now = datetime.utcnow()
+        key = f"{symbol}_{signal}"
+        if key in sent_browser_alerts:
+            diff = (now - sent_browser_alerts[key]).total_seconds()
+            if diff < 3600:  # 1 hour cooldown
+                return jsonify({"status": "skipped", "msg": f"cooldown {int((3600-diff)/60)}min"})
+
+        sent_browser_alerts[key] = now
+        # Clean old entries
+        cutoff = now.timestamp() - 7200
+        sent_browser_alerts_clean = {k:v for k,v in sent_browser_alerts.items() if v.timestamp() > cutoff}
+        sent_browser_alerts.update(sent_browser_alerts_clean)
+
+        # Build Telegram message
+        sym = symbol.replace("USDT", "")
+        isBull = signal == "BULL_REVERSAL"
+        stars = "⭐⭐⭐" if prob >= 80 else "⭐⭐" if prob >= 65 else "⭐"
+
+        if isBull:
+            msg = (
+                f"🟢 *BULL REVERSAL DETECTED* {stars}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💎 *{sym}/USDT*\n"
+                f"📊 Probability: *{prob}%* | Grade: *{grade}*\n"
+                f"💲 Price: `${price}`\n"
+                f"📈 Today: *+{chg:.2f}%*\n"
+                f"📉 Fell: *{drop:.0f}%* from recent high\n"
+                f"💪 Buy Pressure: *{bp}%* | Vol: *{vol}x*\n"
+                f"📐 RSI: *{rsi}*\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📍 Entry: `{entry}`\n"
+            )
+        else:
+            msg = (
+                f"🔴 *BEAR REVERSAL DETECTED* {stars}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"⚠️ *{sym}/USDT*\n"
+                f"📊 Probability: *{prob}%* | Grade: *{grade}*\n"
+                f"💲 Price: `${price}`\n"
+                f"📉 Today: *{chg:.2f}%*\n"
+                f"📈 Rose: *{rise:.0f}%* from recent low\n"
+                f"🐻 Sell Pressure: *{100-bp}%* | Vol: *{vol}x*\n"
+                f"📐 RSI: *{rsi}*\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📍 Entry: `{entry}`\n"
+            )
+
+        if targets.get("T1"): msg += f"🎯 T1: `{targets['T1']}` | T2: `{targets.get('T2','—')}`\n"
+        if stop: msg += f"🛑 Stop: `{stop}`\n"
+
+        if sigs:
+            msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            msg += f"🔍 *Signals:* {', '.join(sigs[:5])}\n"
+
+        if reasons:
+            msg += f"\n📋 *Why:*\n"
+            for r in reasons[:4]:
+                msg += f"  • {r}\n"
+
+        msg += f"\n🕐 {now.strftime('%Y-%m-%d %H:%M')} UTC"
+        msg += f"\n📊 [View Chart](https://www.tradingview.com/chart/?symbol=BINANCE:{sym}USDT.P&interval=D)"
+
+        telegram.send_message(msg)
+        log.info(f"Telegram alert sent: {symbol} {signal} {prob}%")
+        return jsonify({"status": "sent", "symbol": symbol, "probability": prob})
+
+    except Exception as e:
+        log.error(f"Alert endpoint error: {e}")
+        return jsonify({"status": "error", "msg": str(e)}), 500
 
 @app.route("/health")
 def health():
