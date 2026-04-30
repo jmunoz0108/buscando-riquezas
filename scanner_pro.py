@@ -80,6 +80,9 @@ class ProScanner:
 
         # Sort by volume — higher volume = more reliable signals
         tickers.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
+        
+        # Limit to top 200 for speed (these have most reliable signals anyway)
+        tickers = tickers[:200]
 
         log.info(f"Pro scanning {len(tickers)} coins...")
 
@@ -105,7 +108,7 @@ class ProScanner:
                 vol = float(ticker.get("quoteVolume", 0))
                 funding = 0.0
                 oi, prev_oi = 0, 0
-                if vol > 1_000_000:  # $1M+ volume
+                if vol > 500_000:  # $500K+ volume
                     funding = self.get_funding_rate(symbol)
                     oi, prev_oi = self.get_open_interest_history(symbol)
                     time.sleep(0.05)
@@ -152,7 +155,7 @@ class ProScanner:
 
                 results.append(result)
                 count += 1
-                time.sleep(0.08)
+                time.sleep(0.03)
 
             except Exception as e:
                 log.debug(f"Error {symbol}: {e}")
