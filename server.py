@@ -68,7 +68,7 @@ def _send_alerts(result):
 
 
 def scheduler_loop():
-    time.sleep(20)
+    time.sleep(5)
     while True:
         try:
             run_scan()
