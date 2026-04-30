@@ -237,6 +237,8 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellips
   <div class="mi"><span class="ml">AI Bear</span><span class="mv r" id="mb-br">—</span></div>
   <span class="ms">|</span>
   <div class="mi"><span class="ml">Updated</span><span class="mv w" id="mb-t">—</span></div>
+  <span class="ms">|</span>
+  <div class="mi"><span class="ml">📱 Telegram</span><span class="mv g" id="mb-tg">—</span></div>
 </div>
 
 <div class="tabs">
@@ -589,6 +591,18 @@ async function runClientAI(){
     '<div class="empty" style="grid-column:1/-1">No bull reversals detected</div>';
   document.getElementById("bear-grid").innerHTML=clientBear.length?clientBear.map(function(c){return revCard(c,null);}).join(""):
     '<div class="empty" style="grid-column:1/-1">No bear reversals detected</div>';
+
+  // ── SEND TELEGRAM ALERTS for high confidence signals ──
+  var alertsSent = 0;
+  results.forEach(function(coin) {
+    if(coin.probability >= 60 && alertsSent < 5) {
+      setTimeout(function() { sendTelegramAlert(coin); }, alertsSent * 3000);
+      alertsSent++;
+    }
+  });
+  if(alertsSent > 0) {
+    showToast("📱 Sending " + alertsSent + " Telegram alert" + (alertsSent>1?"s":"") + "...");
+  }
 }
 
 // ── REVERSAL CARD HTML ──
@@ -886,7 +900,69 @@ async function aiScan(){
 }
 async function fetchAll(){await fullScan();await runClientAI();}
 
+
+// ── TELEGRAM ALERT SENDER ──
+var tgSent = {};  // dedup in browser too
+
+async function sendTelegramAlert(coin) {
+  var key = coin.symbol + "_" + coin.signal;
+  var now = Date.now();
+  // Don't send same alert twice within 30 min from browser
+  if(tgSent[key] && (now - tgSent[key]) < 1800000) return;
+  tgSent[key] = now;
+
+  try {
+    var res = await fetch("/api/alert", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(coin)
+    });
+    var data = await res.json();
+    if(data.status === "sent") {
+      console.log("Telegram alert sent:", coin.symbol, coin.probability + "%");
+      showToast("📱 Telegram alert sent: " + coin.symbol.replace("USDT","") + " " + coin.probability + "%");
+    } else {
+      console.log("Alert skipped:", data.msg);
+    }
+  } catch(e) {
+    console.error("Alert send error:", e);
+  }
+}
+
+// ── TOAST NOTIFICATION ──
+function showToast(msg) {
+  var t = document.getElementById("toast");
+  if(!t) {
+    t = document.createElement("div");
+    t.id = "toast";
+    t.style.cssText = "position:fixed;bottom:24px;right:24px;background:var(--g2);border:1px solid var(--green);color:var(--green);padding:10px 16px;border-radius:10px;font-size:12px;font-weight:600;z-index:9999;transition:opacity .3s;max-width:300px";
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.style.opacity = "1";
+  clearTimeout(t._timer);
+  t._timer = setTimeout(function(){ t.style.opacity = "0"; }, 4000);
+}
+
 // ── AUTO START ──
+
+// Check Telegram status
+fetch("/api/status").then(function(r){return r.json();}).then(function(d){
+  var el = document.getElementById("mb-tg");
+  if(el) {
+    if(d.telegram) {
+      el.textContent = "ON ✓";
+      el.className = "mv g";
+    } else {
+      el.textContent = "OFF — add TELEGRAM_TOKEN";
+      el.className = "mv r";
+    }
+  }
+}).catch(function(){
+  var el = document.getElementById("mb-tg");
+  if(el) { el.textContent = "Server check..."; el.className = "mv a"; }
+});
+
 fullScan();
 setTimeout(scanPatterns,3000);
 setTimeout(runClientAI,6000);
