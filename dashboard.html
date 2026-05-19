@@ -968,5 +968,176 @@ setTimeout(scanPatterns,3000);
 setTimeout(runClientAI,6000);
 setInterval(fullScan,30000);
 </script>
+  <!-- 
+  PASTE THIS ENTIRE BLOCK right before </body> in your dashboard HTML file.
+  It reads the signals your dashboard already shows and sends them to the
+  server every 60 seconds so the warfare bot can read them.
+  No other changes needed.
+-->
+<script>
+(function() {
+    'use strict';
+
+    const PUSH_URL = '/api/signals/push';
+    let lastHash = '';
+
+    // Extracts signal cards from the reversal bot dashboard DOM.
+    // Adjust the selectors if your dashboard uses different class names.
+    function extractSignals() {
+        const bull = [], bear = [], top = [];
+
+        // ── Method 1: Read from window globals if dashboard stores them ──
+        // Try common variable names the dashboard JS might use
+        const globalCandidates = [
+            window.bullSignals, window.bearSignals, window.topPicks,
+            window.signals, window.reversalData, window.scanResults,
+            window.dashboardSignals, window.allSignals
+        ];
+        for (const arr of globalCandidates) {
+            if (!Array.isArray(arr) || arr.length === 0) continue;
+            arr.forEach(s => {
+                if (!s || !s.symbol) return;
+                const sym = s.symbol.endsWith('USDT') ? s.symbol : s.symbol + 'USDT';
+                const prob = parseFloat(s.probability || s.prob || s.score || 50);
+                const sig  = (s.signal || s.type || '').toUpperCase();
+                const grade = prob>=88?'S':prob>=78?'A':prob>=68?'B':'C';
+                const entry = { ...s, symbol: sym, probability: prob, grade, source: 'browser_dashboard' };
+                if (sig.includes('BULL') || s.action === 'LONG') bull.push(entry);
+                else if (sig.includes('BEAR') || s.action === 'SHORT') bear.push(entry);
+                if (grade === 'S' || grade === 'A') top.push(entry);
+            });
+            if (bull.length + bear.length > 0) {
+                console.log(`📡 Signals from window.${Object.keys(window).find(k=>window[k]===arr)}`);
+                return { bull, bear, top };
+            }
+        }
+
+        // ── Method 2: Scrape signal cards from the DOM ───────────────────
+        const cardSelectors = [
+            '.signal-card', '.reversal-card', '.coin-card',
+            '[data-symbol]', '.pick-card', '.top-pick',
+            '.bull-card', '.bear-card'
+        ];
+
+        let cards = [];
+        for (const sel of cardSelectors) {
+            const found = document.querySelectorAll(sel);
+            if (found.length > 0) { cards = Array.from(found); break; }
+        }
+
+        // Fallback: any div/article that contains a percentage and a coin name
+        if (cards.length === 0) {
+            cards = Array.from(document.querySelectorAll('div, article')).filter(el => {
+                const text = el.textContent;
+                return text.match(/\d+%/) && text.match(/USDT|BTC|ETH|BNB/i) && el.children.length > 1;
+            }).slice(0, 50);
+        }
+
+        cards.forEach(card => {
+            try {
+                const text = card.textContent;
+                const cls  = card.className.toLowerCase();
+
+                // Symbol
+                let symbol = '';
+                const symEl = card.querySelector('.symbol,.ticker,.coin-symbol,[class*="symbol"],[class*="ticker"],h2,h3,h4,strong');
+                if (symEl) symbol = symEl.textContent.trim().replace(/[^A-Z0-9]/gi, '').toUpperCase();
+                if (!symbol) {
+                    const m = text.match(/\b([A-Z]{2,10})USDT\b/);
+                    if (m) symbol = m[1] + 'USDT';
+                }
+                if (!symbol || symbol.length < 3) return;
+                if (!symbol.endsWith('USDT')) symbol += 'USDT';
+
+                // Probability
+                const probEl = card.querySelector('.probability,.prob,.percentage,[class*="prob"],[class*="percent"]');
+                let prob = 0;
+                if (probEl) {
+                    prob = parseFloat(probEl.textContent.replace(/[^0-9.]/g,''));
+                } else {
+                    const m = text.match(/(\d{2,3})%/);
+                    if (m) prob = parseFloat(m[1]);
+                }
+                if (prob < 45 || prob > 100) return;
+
+                // Direction
+                let signal = '';
+                if (cls.includes('bull') || card.querySelector('.bull,[class*="bull"]')) signal = 'BULL_REVERSAL';
+                else if (cls.includes('bear') || card.querySelector('.bear,[class*="bear"]')) signal = 'BEAR_REVERSAL';
+
+                if (!signal) {
+                    // Guess from price change
+                    const m = text.match(/([+-]?\d+\.?\d+)%/);
+                    const chg = m ? parseFloat(m[1]) : 0;
+                    signal = chg < 0 ? 'BULL_REVERSAL' : 'BEAR_REVERSAL';
+                }
+
+                const grade = prob>=88?'S':prob>=78?'A':prob>=68?'B':'C';
+
+                // Extract RSI if visible
+                let rsi = 50;
+                const rsiM = text.match(/RSI[:\s]*(\d+)/i);
+                if (rsiM) rsi = parseFloat(rsiM[1]);
+
+                const entry = {
+                    symbol, probability: prob, signal, grade,
+                    rsi_daily: rsi, source: 'browser_dashboard',
+                    reasons: [], signals_hit: []
+                };
+
+                if (signal === 'BULL_REVERSAL') bull.push(entry);
+                else bear.push(entry);
+                if (grade === 'S' || grade === 'A') top.push(entry);
+
+            } catch(e) {}
+        });
+
+        return { bull, bear, top };
+    }
+
+    async function pushToServer() {
+        try {
+            const signals = extractSignals();
+            const total = signals.bull.length + signals.bear.length;
+            if (total === 0) return;
+
+            // Skip if nothing changed
+            const hash = JSON.stringify(signals.bull.map(s=>s.symbol+s.probability).sort());
+            if (hash === lastHash) return;
+            lastHash = hash;
+
+            const res = await fetch(PUSH_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(signals)
+            });
+
+            if (res.ok) {
+                const r = await res.json();
+                console.log(`✅ Pushed to server: bull=${signals.bull.length} bear=${signals.bear.length} top=${signals.top.length}`);
+            }
+        } catch(e) {
+            // Server starting up — skip silently
+        }
+    }
+
+    // Push 3s after page load (wait for signals to render)
+    setTimeout(pushToServer, 3000);
+    // Push every 60s
+    setInterval(pushToServer, 60000);
+
+    // Also push when the page updates (new scan results appear)
+    const target = document.querySelector('main,#app,#root,#signals,.signals-container,body');
+    if (target) {
+        const obs = new MutationObserver(() => {
+            clearTimeout(obs._t);
+            obs._t = setTimeout(pushToServer, 2000);
+        });
+        obs.observe(target, { childList: true, subtree: true });
+    }
+
+    console.log('📡 Signal push active → /api/signals/push every 60s');
+})();
+</script>
 </body>
 </html>
