@@ -1,30 +1,12 @@
 """
 reversal_pro.py — GAME CHANGER Reversal Detection Engine
 
-What makes this different from everything else:
-
-1. RSI DIVERGENCE — The #1 professional reversal signal
-   Price makes lower low BUT RSI makes higher low = hidden buying
-   This happens BEFORE price reverses — catches it early
-
-2. SQUEEZE POTENTIAL SCORE — Mathematical squeeze detection
-   Extreme negative funding + Rising OI + Falling price = Short squeeze bomb
-   When this triggers, violent 20-50% moves happen within hours
-
-3. CHANGE OF CHARACTER (CHoCH) — Smart Money Concept
-   First Higher Low after downtrend = THE signal institutions use
-   First Lower High after uptrend = Bear CHoCH
-
-4. VOLUME ABSORPTION — Iceberg order detection
-   Massive volume but tiny candle body = someone absorbing all sells
-   This is what happens right before a reversal
-
-5. MULTI-TIMEFRAME CONFLUENCE — Signal must appear 3+ timeframes
-   5m + 1h + 1D agreement = 85%+ probability historically
-
-6. COMPOSITE PROBABILITY SCORE — Based on all factors combined
-   Gives each coin a 0-100% probability of reversal
-   Only coins above 70% make the final list
+FIXES applied:
+- Bear reversal threshold: rise_from_low >= 20% → >= 8% (was missing coins near lows)
+- Also triggers bear scan for coins pumped 15%+ TODAY (RONIN +33% = short target)
+- Minimum probability: 38% → 28% (catches forming signals in bear market)
+- Added "today's pump" bonus scoring for bear reversals
+- Added D-grade tier for forming signals
 """
 
 import numpy as np
@@ -35,10 +17,6 @@ log = logging.getLogger(__name__)
 
 
 class ProReversalEngine:
-
-    # ─────────────────────────────────────────────────
-    #  MAIN ANALYSIS
-    # ─────────────────────────────────────────────────
 
     def analyze(self, symbol, klines_5m, klines_1h, klines_4h, klines_1d, ticker, funding_rate=0, open_interest=0, prev_oi=0):
         try:
@@ -55,13 +33,11 @@ class ProReversalEngine:
             vol24   = float(ticker.get("quoteVolume", 0))
             vol_avg = float(np.mean([float(k[7]) for k in klines_1d[-14:]])) if len(klines_1d) >= 14 else vol24
 
-            # Derived structure
             high52 = max(d["high"][-52:]) if len(d["high"]) >= 52 else max(d["high"])
             low52  = min(d["low"][-52:])  if len(d["low"])  >= 52 else min(d["low"])
             drop_from_high = (high52 - price) / high52 * 100
             rise_from_low  = (price - low52)  / low52  * 100
 
-            # Core indicators
             rsi_d  = self._rsi(d["close"], 14)
             rsi_h1 = self._rsi(h1["close"], 14) if h1 else []
             rsi_h4 = self._rsi(h4["close"], 14) if h4 else []
@@ -78,19 +54,24 @@ class ProReversalEngine:
                     d, h1, h4, m5, rsi_d, rsi_h1, rsi_h4, rsi_m5,
                     macd_d, macd_h1, atr_d, funding_rate, open_interest, prev_oi
                 )
-                if bull["probability"] >= 38:
+                # Lowered from 38% to 28% — catches forming signals in bear market
+                if bull["probability"] >= 28:
                     return self._build_result(symbol, price, chg24, vol24, vol_avg,
                                               drop_from_high, rise_from_low, rsi_d,
                                               "BULL_REVERSAL", bull, atr_d)
 
             # ── BEAR REVERSAL ──
-            if rise_from_low >= 20:
+            # FIX: was rise_from_low >= 20 — missed coins near yearly lows
+            # Now: trigger if risen 8%+ from low OR pumped 15%+ today
+            is_bear_candidate = rise_from_low >= 8 or chg24 >= 15
+            if is_bear_candidate:
                 bear = self._score_bear_reversal(
                     price, chg24, vol24, vol_avg, rise_from_low,
                     d, h1, h4, m5, rsi_d, rsi_h1, rsi_h4, rsi_m5,
                     macd_d, macd_h1, atr_d, funding_rate, open_interest, prev_oi
                 )
-                if bear["probability"] >= 38:
+                # Lowered from 38% to 28%
+                if bear["probability"] >= 28:
                     return self._build_result(symbol, price, chg24, vol24, vol_avg,
                                               drop_from_high, rise_from_low, rsi_d,
                                               "BEAR_REVERSAL", bear, atr_d)
@@ -108,7 +89,8 @@ class ProReversalEngine:
             "S — PERFECT SETUP" if prob >= 88 else
             "A — STRONG SIGNAL" if prob >= 78 else
             "B — GOOD SIGNAL"   if prob >= 68 else
-            "C — WATCH"
+            "C — WATCH"         if prob >= 45 else
+            "D — FORMING"
         )
         return {
             "symbol":          symbol,
@@ -149,7 +131,6 @@ class ProReversalEngine:
         points   = 0
         max_pts  = 0
 
-        # ══ SIGNAL 1: RSI DIVERGENCE (15 pts — most powerful) ══
         max_pts += 15
         div = self._detect_rsi_divergence(d["close"], d["low"], rsi_d, "bull")
         if div == "strong":
@@ -170,7 +151,6 @@ class ProReversalEngine:
             reasons.append("📊 4H RSI Divergence confirms daily — multi-timeframe alignment")
             if "4H" not in timeframes: timeframes.append("4H")
 
-        # ══ SIGNAL 2: SQUEEZE POTENTIAL (15 pts) ══
         max_pts += 15
         squeeze = self._squeeze_potential_bull(funding_rate, oi, prev_oi, chg24, vol24, vol_avg)
         if squeeze >= 80:
@@ -186,7 +166,6 @@ class ProReversalEngine:
             signals.append("Mild Squeeze Pressure")
             reasons.append(f"🔺 Mild squeeze pressure — shorts uncomfortable")
 
-        # ══ SIGNAL 3: CHANGE OF CHARACTER CHoCH (12 pts) ══
         max_pts += 12
         choch = self._detect_choch_bull(d["high"], d["low"], d["close"])
         if choch == "confirmed":
@@ -202,7 +181,6 @@ class ProReversalEngine:
             reasons.append("🏗️ 4H Change of Character — shorter timeframe confirms reversal")
             if "4H" not in timeframes: timeframes.append("4H")
 
-        # ══ SIGNAL 4: VOLUME ABSORPTION (10 pts) ══
         max_pts += 10
         absorption = self._detect_absorption(d["close"], d["open"], d["high"], d["low"], d["volume"], "bull")
         if absorption == "strong":
@@ -214,11 +192,9 @@ class ProReversalEngine:
             signals.append("Volume Absorption")
             reasons.append("🧲 Absorption detected: High volume, small bodies — buyers holding the line")
 
-        # ══ SIGNAL 5: MACD DIVERGENCE / CROSSOVER (10 pts) ══
         max_pts += 10
         if macd_d and len(macd_d["hist"]) >= 5:
             h = macd_d["hist"]
-            # MACD histogram making higher lows while price makes lower lows
             if h[-1] > h[-3] and h[-3] > h[-5] and d["close"][-1] < d["close"][-3]:
                 points += 10
                 signals.append("MACD Hidden Divergence")
@@ -232,7 +208,6 @@ class ProReversalEngine:
                 signals.append("MACD Zero Cross")
                 reasons.append("📈 MACD crossed zero line bullish")
 
-        # ══ SIGNAL 6: RSI EXTREME + RECOVERY (8 pts) ══
         max_pts += 8
         if rsi_d and len(rsi_d) >= 5:
             rsi_min = min(rsi_d[-10:]) if len(rsi_d) >= 10 else min(rsi_d)
@@ -252,7 +227,6 @@ class ProReversalEngine:
                 points += 2
                 reasons.append(f"📊 RSI ({rsi_d[-1]:.0f}) trending up")
 
-        # ══ SIGNAL 7: MULTI-TF CONFLUENCE (8 pts) ══
         max_pts += 8
         tf_bull_count = 0
         if rsi_h1 and len(rsi_h1) >= 3 and rsi_h1[-1] > rsi_h1[-2] and rsi_h1[-1] < 50:
@@ -273,7 +247,6 @@ class ProReversalEngine:
             signals.append("TF Confluence (2/3)")
             reasons.append(f"📊 {tf_bull_count}/3 timeframes confirming bullish momentum")
 
-        # ══ SIGNAL 8: VOLUME SURGE (7 pts) ══
         max_pts += 7
         vol_r = vol24 / vol_avg if vol_avg > 0 else 1
         if vol_r >= 3.0 and chg24 > 0:
@@ -291,7 +264,6 @@ class ProReversalEngine:
             points += 2
             reasons.append(f"📊 Normal volume ({vol_r:.1f}x) — steady participation")
 
-        # ══ SIGNAL 8b: POSITIVE DAY BONUS ══
         if chg24 >= 8:
             points += 6
             reasons.append(f"📈 Strong +{chg24:.1f}% today — reversal momentum confirmed")
@@ -302,7 +274,6 @@ class ProReversalEngine:
             points += 2
             reasons.append(f"📈 Small gain today (+{chg24:.1f}%) — stabilizing")
 
-        # ══ SIGNAL 9: PRICE STRUCTURE (7 pts) ══
         max_pts += 7
         if len(d["low"]) >= 10:
             recent_lows = d["low"][-10:]
@@ -315,7 +286,6 @@ class ProReversalEngine:
                 points += 4
                 reasons.append("📐 Recent lows higher than earlier lows — slow accumulation forming")
 
-        # ══ SIGNAL 10: DROP DEPTH (5 pts) ══
         max_pts += 5
         if drop >= 70:
             points += 5
@@ -333,20 +303,16 @@ class ProReversalEngine:
             points += 1
             reasons.append(f"📉 Down {drop:.0f}% from recent high")
 
-        # ══ BONUS: FUNDING RATE NEGATIVE (extra squeeze fuel) ══
         if funding_rate < -0.05:
             points += 3
             reasons.append(f"💸 Very negative funding ({funding_rate:.4f}%) — shorts paying heavily to stay short")
 
-        # ══ BONUS: OI RISING WHILE PRICE FALLING (short build-up = squeeze fuel) ══
         if prev_oi > 0 and oi > prev_oi * 1.05 and chg24 < -2:
             points += 4
             reasons.append(f"📊 Open Interest rising while price falls — shorts stacking = squeeze fuel building")
 
-        # Probability calculation
         probability = round(min((points / max(max_pts, 1)) * 100, 100), 1) if max_pts > 0 else 0
 
-        # Targets based on ATR
         atr_val = atr_d[-1] if atr_d else price * 0.03
         t1 = round(price * 1.08, 6)
         t2 = round(price * 1.18, 6)
@@ -381,7 +347,6 @@ class ProReversalEngine:
         points   = 0
         max_pts  = 0
 
-        # RSI BEARISH DIVERGENCE
         max_pts += 15
         div = self._detect_rsi_divergence(d["close"], d["high"], rsi_d, "bear")
         if div == "strong":
@@ -394,7 +359,6 @@ class ProReversalEngine:
             signals.append("RSI Bearish Divergence")
             reasons.append("📊 RSI Bearish Divergence: momentum fading while price still rising")
 
-        # LONG SQUEEZE POTENTIAL
         max_pts += 15
         squeeze = self._squeeze_potential_bear(funding_rate, oi, prev_oi, chg24, vol24, vol_avg)
         if squeeze >= 80:
@@ -409,7 +373,6 @@ class ProReversalEngine:
             points += 5
             reasons.append(f"🔻 Long squeeze pressure building")
 
-        # CHoCH BEARISH
         max_pts += 12
         choch = self._detect_choch_bear(d["high"], d["low"], d["close"])
         if choch == "confirmed":
@@ -418,7 +381,6 @@ class ProReversalEngine:
             reasons.append("🏗️ BEAR Change of Character: First Lower High after uptrend — Smart Money distributing")
             timeframes.append("1D")
 
-        # VOLUME DISTRIBUTION (sellers absorbing buyers)
         max_pts += 10
         absorption = self._detect_absorption(d["close"], d["open"], d["high"], d["low"], d["volume"], "bear")
         if absorption == "strong":
@@ -430,7 +392,6 @@ class ProReversalEngine:
             signals.append("Mild Distribution")
             reasons.append("🧲 Distribution pattern: weakening buying pressure")
 
-        # MACD BEARISH
         max_pts += 10
         if macd_d and len(macd_d["hist"]) >= 5:
             h = macd_d["hist"]
@@ -443,7 +404,6 @@ class ProReversalEngine:
                 signals.append("MACD Turning Bearish")
                 reasons.append("📉 MACD histogram falling from positive — momentum reversing")
 
-        # RSI OVERBOUGHT
         max_pts += 8
         if rsi_d and len(rsi_d) >= 5:
             rsi_max = max(rsi_d[-10:]) if len(rsi_d) >= 10 else max(rsi_d)
@@ -455,8 +415,10 @@ class ProReversalEngine:
                 points += 5
                 signals.append("RSI Overbought Declining")
                 reasons.append(f"🔋 RSI overbought ({rsi_d[-1]:.0f}) starting to fall")
+            elif rsi_d[-1] > 60 and rsi_d[-1] < rsi_d[-2]:
+                points += 3
+                reasons.append(f"📊 RSI ({rsi_d[-1]:.0f}) extended and declining")
 
-        # TF CONFLUENCE
         max_pts += 8
         tf_bear_count = 0
         if rsi_h1 and len(rsi_h1) >= 3 and rsi_h1[-1] < rsi_h1[-2] and rsi_h1[-1] > 50:
@@ -476,7 +438,6 @@ class ProReversalEngine:
             points += 4
             reasons.append(f"📊 {tf_bear_count}/3 timeframes bearish")
 
-        # VOLUME DRYING UP ON RALLIES
         max_pts += 7
         vol_r = vol24 / vol_avg if vol_avg > 0 else 1
         if vol_r < 0.5 and chg24 > 2:
@@ -487,7 +448,6 @@ class ProReversalEngine:
             points += 4
             reasons.append(f"📊 Below average volume ({vol_r:.1f}x) — rally lacks conviction")
 
-        # PRICE STRUCTURE
         max_pts += 7
         if len(d["high"]) >= 10:
             recent_highs = d["high"][-10:]
@@ -497,7 +457,6 @@ class ProReversalEngine:
                 signals.append("Lower Highs Structure")
                 reasons.append("📐 Lower highs forming — buyers losing strength, distribution in progress")
 
-        # RISE DEPTH
         max_pts += 5
         if rise >= 150:
             points += 5
@@ -509,12 +468,35 @@ class ProReversalEngine:
             points += 2
             reasons.append(f"📈 Up {rise:.0f}% from low — notable extension")
 
-        # FUNDING POSITIVE
+        # ── TODAY'S PUMP BONUS (NEW) ──────────────────────────────────────────
+        # Coins that pumped hard today are prime short targets
+        max_pts += 10
+        if chg24 >= 30:
+            points += 10
+            signals.append("Massive Single-Day Pump")
+            reasons.append(f"🚨 UP {chg24:.0f}% TODAY — parabolic single-day moves always retrace 50-80%")
+        elif chg24 >= 20:
+            points += 8
+            signals.append("Large Single-Day Pump")
+            reasons.append(f"🚨 UP {chg24:.0f}% today — extreme single-day move, reversal likely")
+        elif chg24 >= 15:
+            points += 6
+            signals.append("Significant Daily Pump")
+            reasons.append(f"📈 UP {chg24:.0f}% today — overextended, watching for reversal")
+        elif chg24 >= 10:
+            points += 4
+            reasons.append(f"📈 UP {chg24:.0f}% today — notable daily move")
+
+        # RSI overbought after big pump = double signal
+        if rsi_d and rsi_d[-1] > 70 and chg24 >= 10:
+            points += 6
+            signals.append("RSI Overbought After Pump")
+            reasons.append(f"⚠️  RSI {rsi_d[-1]:.0f} overbought after {chg24:.0f}% pump — double reversal signal")
+
         if funding_rate > 0.05:
             points += 3
             reasons.append(f"💸 Very positive funding ({funding_rate:.4f}%) — longs paying, unsustainable")
 
-        # OI RISING WHILE PRICE RISING (too many longs = squeeze fuel)
         if prev_oi > 0 and oi > prev_oi * 1.05 and chg24 > 2:
             points += 4
             reasons.append(f"📊 OI rising while price pumps — overleveraged longs = liquidation risk")
@@ -543,15 +525,10 @@ class ProReversalEngine:
         }
 
     # ─────────────────────────────────────────────────
-    #  GAME-CHANGER DETECTION METHODS
+    #  DETECTION METHODS
     # ─────────────────────────────────────────────────
 
     def _detect_rsi_divergence(self, closes, pivots, rsi_vals, direction):
-        """
-        RSI Divergence — The MOST POWERFUL reversal signal.
-        Bullish: Price lower low + RSI higher low = hidden buying
-        Bearish: Price higher high + RSI lower high = hidden selling
-        """
         if len(rsi_vals) < 10 or len(closes) < 10:
             return None
 
@@ -559,141 +536,88 @@ class ProReversalEngine:
         pivots  = np.array(pivots)
         rsi_arr = np.array(rsi_vals)
 
-        # Compare last two significant pivot points
-        # For bull: look at lows. For bear: look at highs
         if direction == "bull":
-            # Find two recent lows
             p1_idx = len(pivots) - 1
             p2_idx = max(0, len(pivots) - 8)
-
             p1_price = min(pivots[p2_idx:])
             p2_price = min(pivots[max(0, p2_idx-8):p2_idx]) if p2_idx > 0 else p1_price
-
             rsi_at_p1 = min(rsi_arr[max(0, p2_idx-2):])
             rsi_at_p2 = min(rsi_arr[:max(1, p2_idx-6)]) if p2_idx > 6 else rsi_at_p1
-
-            # Price made LOWER low but RSI made HIGHER low = bullish divergence
             if p1_price < p2_price * 0.97 and rsi_at_p1 > rsi_at_p2 + 3:
-                if rsi_at_p1 < 40:  # RSI should be in oversold region for validity
+                if rsi_at_p1 < 40:
                     return "strong" if (rsi_at_p1 - rsi_at_p2) > 8 else "regular"
-
-        else:  # bear
-            # Find two recent highs
+        else:
             p2_idx = max(0, len(pivots) - 8)
             p1_price = max(pivots[p2_idx:])
             p2_price = max(pivots[:max(1, p2_idx)]) if p2_idx > 0 else p1_price
-
             rsi_at_p1 = max(rsi_arr[max(0, p2_idx-2):])
             rsi_at_p2 = max(rsi_arr[:max(1, p2_idx-6)]) if p2_idx > 6 else rsi_at_p1
-
-            # Price made HIGHER high but RSI made LOWER high = bearish divergence
             if p1_price > p2_price * 1.03 and rsi_at_p1 < rsi_at_p2 - 3:
-                if rsi_at_p1 > 60:  # RSI should be in overbought region for validity
+                if rsi_at_p1 > 60:
                     return "strong" if (rsi_at_p2 - rsi_at_p1) > 8 else "regular"
 
         return None
 
     def _squeeze_potential_bull(self, funding_rate, oi, prev_oi, chg24, vol24, vol_avg):
-        """
-        Short Squeeze Potential Score (0-100).
-        When shorts are too crowded + price starts moving up = cascade of forced closings.
-        """
         score = 0
-
-        # Extreme negative funding = shorts paying a LOT = unsustainable
         if funding_rate < -0.10:  score += 40
         elif funding_rate < -0.05: score += 28
         elif funding_rate < -0.02: score += 15
         elif funding_rate < -0.01: score += 8
-
-        # Rising OI while price falls = MORE shorts opening = more fuel
         if prev_oi > 0:
             oi_change = (oi - prev_oi) / prev_oi * 100
             if oi_change > 15 and chg24 < -5:  score += 30
             elif oi_change > 10 and chg24 < -3: score += 20
             elif oi_change > 5 and chg24 < 0:  score += 10
-
-        # Price starting to move up (initial squeeze trigger)
         if chg24 > 5:   score += 20
         elif chg24 > 2: score += 12
         elif chg24 > 0: score += 5
-
-        # Volume surge (forced closings = volume spike)
         vol_r = vol24 / vol_avg if vol_avg > 0 else 1
         if vol_r > 3:   score += 10
         elif vol_r > 2: score += 6
-
         return min(score, 100)
 
     def _squeeze_potential_bear(self, funding_rate, oi, prev_oi, chg24, vol24, vol_avg):
-        """Long Squeeze Potential Score."""
         score = 0
-
         if funding_rate > 0.10:   score += 40
         elif funding_rate > 0.05: score += 28
         elif funding_rate > 0.02: score += 15
         elif funding_rate > 0.01: score += 8
-
         if prev_oi > 0:
             oi_change = (oi - prev_oi) / prev_oi * 100
             if oi_change > 15 and chg24 > 5:   score += 30
             elif oi_change > 10 and chg24 > 2: score += 20
             elif oi_change > 5 and chg24 > 0:  score += 10
-
         if chg24 < -5:   score += 20
         elif chg24 < -2: score += 12
         elif chg24 < 0:  score += 5
-
         vol_r = vol24 / vol_avg if vol_avg > 0 else 1
         if vol_r > 3:   score += 10
         elif vol_r > 2: score += 6
-
         return min(score, 100)
 
     def _detect_choch_bull(self, highs, lows, closes):
-        """
-        Change of Character (CHoCH) — Smart Money Concept.
-        Bullish CHoCH: After a series of lower highs and lower lows,
-        price forms the FIRST Higher Low = structure is changing.
-        This is where institutions start accumulating.
-        """
         if len(lows) < 8:
             return None
-
         lows = np.array(lows)
         highs = np.array(highs)
-
-        # Check last 8 candles for CHoCH pattern
-        # We need: at least 2 lower lows followed by 1 higher low
         recent = lows[-8:]
-
-        # Find if there was a downtrend (lower lows)
         had_lower_lows = recent[2] < recent[0] and recent[4] < recent[2]
-
-        # Check if latest low is higher than the previous low
         if had_lower_lows and len(recent) >= 7:
             last_low  = recent[-1]
             prev_low  = recent[-3]
-            if last_low > prev_low * 1.005:  # Latest low is higher = CHoCH
-                # Confirm with close (should be above midpoint of range)
+            if last_low > prev_low * 1.005:
                 if closes[-1] > (highs[-1] + lows[-1]) / 2:
                     return "confirmed"
                 return "forming"
-
         return None
 
     def _detect_choch_bear(self, highs, lows, closes):
-        """
-        Bearish CHoCH: After uptrend, first Lower High appears.
-        """
         if len(highs) < 8:
             return None
-
         highs = np.array(highs)
         recent = highs[-8:]
-
         had_higher_highs = recent[2] > recent[0] and recent[4] > recent[2]
-
         if had_higher_highs and len(recent) >= 7:
             last_high = recent[-1]
             prev_high = recent[-3]
@@ -701,52 +625,30 @@ class ProReversalEngine:
                 if closes[-1] < (highs[-1] + lows[-1]) / 2:
                     return "confirmed"
                 return "forming"
-
         return None
 
     def _detect_absorption(self, closes, opens, highs, lows, volumes, direction):
-        """
-        Volume Absorption — Detects when large players are absorbing supply/demand.
-        
-        BULL Absorption: Huge volume + small body + candle holds above key level
-        = Someone is buying EVERYTHING being sold = floor being established
-        
-        BEAR Absorption: Huge volume + small body + candle holds below resistance
-        = Someone is selling EVERYTHING being bought = ceiling being established
-        """
         if len(volumes) < 10:
             return None
-
         avg_vol  = np.mean(volumes[-20:]) if len(volumes) >= 20 else np.mean(volumes)
         avg_body = np.mean([abs(closes[i] - opens[i]) for i in range(-10, 0)])
-
         absorption_count = 0
-
         for i in range(-5, 0):
             body  = abs(closes[i] - opens[i])
             range_ = highs[i] - lows[i]
             vol   = volumes[i]
-
-            # High volume + small body relative to range = absorption
             if vol > avg_vol * 1.8 and range_ > 0 and body / range_ < 0.25:
                 if direction == "bull":
-                    # Close should be in upper half of candle (buyers holding)
                     if closes[i] > (highs[i] + lows[i]) / 2:
                         absorption_count += 1
                 else:
-                    # Close should be in lower half (sellers holding)
                     if closes[i] < (highs[i] + lows[i]) / 2:
                         absorption_count += 1
-
         if absorption_count >= 3:
             return "strong"
         elif absorption_count >= 2:
             return "moderate"
         return None
-
-    # ─────────────────────────────────────────────────
-    #  TECHNICAL INDICATORS
-    # ─────────────────────────────────────────────────
 
     def _parse(self, klines):
         return {
