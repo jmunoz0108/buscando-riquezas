@@ -1,326 +1,576 @@
-from flask import Flask, jsonify, Response, request
-from reversal_pro import ProReversalEngine
-from scanner_pro import ProScanner
-from news import NewsScanner
-from telegram_bot import TelegramAlerter
-import threading, time, logging, os
-from datetime import datetime
+"""
+Reversal Bot Pro — server.py
+============================
+Flask API server that:
+1. Runs the Python scanner every 30 minutes
+2. Accepts signals pushed from the dashboard browser JS
+3. Serves /api/bull, /api/bear, /api/top, /api/alert
+   (returns browser-detected signals when Python scanner finds 0)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger(__name__)
+The warfare bot reads from this server.
+The dashboard JS posts to /api/signals/push every 60s.
+"""
 
-app      = Flask(__name__)
-engine   = ProReversalEngine()
-scanner  = ProScanner()
-news_sc  = NewsScanner()
-telegram = TelegramAlerter()
+import os
+import json
+import time
+import logging
+import threading
+import datetime
+import requests
 
-latest_scan    = {}
-scan_history   = []
-last_scan_time = None
-is_scanning    = False
-sent_alerts    = set()
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
-# ── Browser signal cache (from dashboard JS → /api/alert) ──────────────────
-# Dashboard finds signals client-side and posts them here.
-# We cache them so the warfare bot can read from /api/bear and /api/bull too.
-browser_bull_signals = {}   # symbol → signal dict
-browser_bear_signals = {}   # symbol → signal dict
-BROWSER_SIGNAL_TTL   = 3600 # 1 hour — signals expire after 1h
+# ── Logging ─────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
 
+app = Flask(__name__)
+CORS(app)
 
-def _get_browser_signals(direction):
-    """Return non-expired browser-detected signals as a list."""
-    now   = datetime.utcnow().timestamp()
-    cache = browser_bear_signals if direction == "bear" else browser_bull_signals
-    valid = []
-    expired = []
-    for sym, entry in cache.items():
-        if now - entry["cached_at"] < BROWSER_SIGNAL_TTL:
-            valid.append(entry["data"])
+# ── In-memory state ──────────────────────────────────────────────────────────
+# Python scanner results (filled every 30 min)
+latest_scan = {
+    "top_picks":      [],
+    "bull_reversals": [],
+    "bear_reversals": [],
+    "scanned_at":     None,
+    "total_scanned":  0,
+}
+
+# Browser cache (filled by dashboard JS via POST /api/signals/push)
+browser_cache = {
+    "bull":        [],
+    "bear":        [],
+    "top":         [],
+    "candle_bull": [],
+    "candle_bear": [],
+    "updated_at":  None,
+}
+
+scan_lock = threading.Lock()
+
+# ── Binance helpers ──────────────────────────────────────────────────────────
+BINANCE_FUTURES = "https://fapi.binance.com"
+BINANCE_SPOT    = "https://api.binance.com"
+
+def get_top_coins(limit=200):
+    """Get top coins by futures volume."""
+    try:
+        r = requests.get(f"{BINANCE_FUTURES}/fapi/v1/ticker/24hr", timeout=15)
+        tickers = r.json()
+        usdt = [t for t in tickers if t.get("symbol","").endswith("USDT")]
+        usdt.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
+        return usdt[:limit]
+    except Exception as e:
+        logging.warning(f"get_top_coins: {e}")
+        return []
+
+def get_klines(symbol, interval="1d", limit=30):
+    """Fetch klines from Binance spot."""
+    try:
+        r = requests.get(
+            f"{BINANCE_SPOT}/api/v3/klines",
+            params={"symbol": symbol, "interval": interval, "limit": limit},
+            timeout=10
+        )
+        return r.json()
+    except Exception:
+        return []
+
+def calc_rsi(closes, period=14):
+    """Wilder RSI."""
+    if len(closes) < period + 1:
+        return 50.0
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains  = [max(d, 0) for d in deltas]
+    losses = [max(-d, 0) for d in deltas]
+    avg_g  = sum(gains[:period]) / period
+    avg_l  = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_g = (avg_g * (period-1) + gains[i]) / period
+        avg_l = (avg_l * (period-1) + losses[i]) / period
+    if avg_l == 0:
+        return 100.0
+    return round(100 - (100 / (1 + avg_g/avg_l)), 2)
+
+# ── Python scanner ───────────────────────────────────────────────────────────
+STABLES = {"USDCUSDT","USD1USDT","BUSDUSDT","TUSDUSDT","FDUSDUSDT","USDTUSDT",
+           "DAIUSDT","FRAXUSDT","USDDUSDT","USDEUSDT"}
+
+def score_coin(ticker, klines_1d):
+    """
+    Score a coin for reversal probability.
+    Returns (probability, signal, grade, details_dict) or None.
+    """
+    symbol   = ticker.get("symbol","")
+    price    = float(ticker.get("lastPrice", 0))
+    chg24    = float(ticker.get("priceChangePercent", 0))
+    vol24    = float(ticker.get("quoteVolume", 0))
+    high24   = float(ticker.get("highPrice", price))
+    low24    = float(ticker.get("lowPrice",  price))
+
+    if not symbol or price <= 0 or symbol in STABLES:
+        return None
+
+    # Need at least a bit of volume
+    if vol24 < 3_000_000:
+        return None
+
+    # Get daily closes for RSI
+    closes_1d = [float(k[4]) for k in klines_1d] if klines_1d else []
+    rsi_daily = calc_rsi(closes_1d) if closes_1d else 50.0
+
+    # 52-week high/low from daily klines
+    highs = [float(k[2]) for k in klines_1d] if klines_1d else [high24]
+    lows  = [float(k[3]) for k in klines_1d] if klines_1d else [low24]
+    high_52w = max(highs) if highs else high24
+    low_52w  = min(lows)  if lows  else low24
+
+    drop_from_high = ((high_52w - price) / high_52w * 100) if high_52w > 0 else 0
+    rise_from_low  = ((price - low_52w) / low_52w * 100)  if low_52w  > 0 else 0
+
+    score  = 0
+    signal = None
+    reasons = []
+    signals_hit = []
+
+    # ── BULL REVERSAL (oversold bounce) ─────────────────────────────────
+    if rsi_daily < 35:
+        score += 20
+        signals_hit.append("RSI Oversold")
+        reasons.append(f"RSI={rsi_daily:.0f} oversold")
+
+    if drop_from_high > 20:
+        score += 15
+        reasons.append(f"Down {drop_from_high:.0f}% from high")
+
+    if chg24 < -5:
+        score += 10
+        reasons.append(f"{chg24:.1f}% today")
+
+    if rsi_daily < 25:
+        score += 10
+        signals_hit.append("Extreme Oversold")
+
+    if chg24 < -10:
+        score += 10
+
+    # volume spike (panic selling = reversal signal)
+    if vol24 > 50_000_000 and chg24 < -5:
+        score += 8
+        signals_hit.append("High Volume Dip")
+
+    if score >= 28:
+        signal = "BULL_REVERSAL"
+        probability = min(30 + score, 88)
+
+    # ── BEAR REVERSAL (overbought pullback) ──────────────────────────────
+    elif rsi_daily > 70 or chg24 > 15:
+        score = 0
+        signals_hit = []
+        reasons = []
+
+        if rsi_daily > 75:
+            score += 20; signals_hit.append("RSI Overbought"); reasons.append(f"RSI={rsi_daily:.0f}")
+        elif rsi_daily > 70:
+            score += 12; signals_hit.append("RSI High")
+
+        if chg24 > 30:
+            score += 25; reasons.append(f"+{chg24:.0f}% today EXTREME")
+        elif chg24 > 20:
+            score += 18; reasons.append(f"+{chg24:.0f}% today")
+        elif chg24 > 15:
+            score += 12; reasons.append(f"+{chg24:.0f}% today")
+        elif chg24 > 8:
+            score += 6
+
+        if rise_from_low > 30:
+            score += 10; reasons.append(f"Up {rise_from_low:.0f}% from low")
+
+        if vol24 > 50_000_000 and chg24 > 15:
+            score += 8; signals_hit.append("High Volume Pump")
+
+        if score >= 28:
+            signal = "BEAR_REVERSAL"
+            probability = min(30 + score, 88)
         else:
-            expired.append(sym)
-    for sym in expired:
-        del cache[sym]
-    valid.sort(key=lambda x: x.get("probability", 0), reverse=True)
-    return valid
+            return None
+    else:
+        return None
+
+    if not signal:
+        return None
+
+    # Grade
+    if probability >= 88:   grade = "S"
+    elif probability >= 78: grade = "A"
+    elif probability >= 68: grade = "B"
+    elif probability >= 58: grade = "C"
+    else:                   grade = "D"
+
+    return {
+        "symbol":        symbol,
+        "probability":   probability,
+        "signal":        signal,
+        "grade":         grade,
+        "price":         price,
+        "rsi_daily":     rsi_daily,
+        "change_24h":    chg24,
+        "volume_24h_usd": vol24,
+        "drop_from_high": drop_from_high,
+        "rise_from_low":  rise_from_low,
+        "signals_hit":    signals_hit,
+        "reasons":        reasons[:3],
+        "divergence":     "regular" if rsi_daily < 35 and chg24 > 0 else None,
+        "choch_detected": False,
+        "absorption":     False,
+        "squeeze_score":  0,
+        "timeframes_confirmed": [],
+        "volume_ratio":   1.0,
+        "source":         "python_scanner",
+        "scanned_at":     datetime.datetime.now().isoformat(),
+    }
 
 
 def run_scan():
-    global latest_scan, last_scan_time, is_scanning, scan_history
-    if is_scanning:
+    """Full scan of top 200 coins. Called every 30 min."""
+    logging.info("🔍 Starting Python reversal scan...")
+    start = time.time()
+
+    tickers = get_top_coins(200)
+    if not tickers:
+        logging.warning("No tickers from Binance — scan aborted")
         return
-    is_scanning = True
-    log.info("Starting Pro Reversal Scan...")
-    try:
-        result = scanner.full_scan(engine, news_sc)
-        latest_scan    = result
-        last_scan_time = datetime.utcnow()
-        scan_history.append({
-            "time": last_scan_time.isoformat(),
-            "bull": len(result.get("bull_reversals", [])),
-            "bear": len(result.get("bear_reversals", [])),
-            "top":  result.get("top_picks", [{}])[0].get("symbol", "---") if result.get("top_picks") else "---",
-        })
-        if len(scan_history) > 20:
-            scan_history.pop(0)
-        _send_alerts(result)
-    except Exception as e:
-        log.error(f"Scan error: {e}")
-    finally:
-        is_scanning = False
+
+    bull_results = []
+    bear_results = []
+    scanned = 0
+    errors  = 0
+
+    for ticker in tickers:
+        symbol = ticker.get("symbol","")
+        if symbol in STABLES:
+            continue
+        try:
+            # Get daily klines for RSI
+            klines = get_klines(symbol, "1d", 30)
+            result = score_coin(ticker, klines)
+            scanned += 1
+
+            if result:
+                if result["signal"] == "BULL_REVERSAL":
+                    bull_results.append(result)
+                elif result["signal"] == "BEAR_REVERSAL":
+                    bear_results.append(result)
+
+            time.sleep(0.05)  # rate limit
+        except Exception as e:
+            errors += 1
+            continue
+
+    # Sort by probability
+    bull_results.sort(key=lambda x: x["probability"], reverse=True)
+    bear_results.sort(key=lambda x: x["probability"], reverse=True)
+
+    # Top picks = S and A grade from both
+    top = [r for r in bull_results + bear_results if r["grade"] in ("S","A")]
+    top.sort(key=lambda x: x["probability"], reverse=True)
+
+    elapsed = round(time.time() - start, 1)
+
+    with scan_lock:
+        latest_scan["bull_reversals"] = bull_results[:20]
+        latest_scan["bear_reversals"] = bear_results[:20]
+        latest_scan["top_picks"]      = top[:10]
+        latest_scan["scanned_at"]     = datetime.datetime.now().isoformat()
+        latest_scan["total_scanned"]  = scanned
+
+    logging.info(
+        f"✅ Scan done in {elapsed}s: {scanned} coins | "
+        f"bull={len(bull_results)} bear={len(bear_results)} errors={errors}"
+    )
 
 
-def _send_alerts(result):
-    global sent_alerts
-    top  = result.get("top_picks", [])
-    if not top and not result.get("bull_reversals") and not result.get("bear_reversals"):
-        return
-    telegram.send_scan_summary(result)
-    for coin in top[:3]:
-        sym = coin.get("symbol", "")
-        key = "top_" + sym + "_" + datetime.utcnow().strftime("%Y%m%d%H")
-        if coin["probability"] >= 75 and key not in sent_alerts:
-            if coin["signal"] == "BULL_REVERSAL":
-                telegram.send_bull_reversal(coin)
-            else:
-                telegram.send_bear_reversal(coin)
-            sent_alerts.add(key)
-            time.sleep(2)
-    if len(sent_alerts) > 500:
-        sent_alerts.clear()
-
-
-def scheduler_loop():
-    time.sleep(5)
+def scan_scheduler():
+    """Background thread — scans every 30 minutes."""
     while True:
         try:
             run_scan()
         except Exception as e:
-            log.error(f"Scheduler: {e}")
-        time.sleep(1800)
+            logging.error(f"Scan error: {e}")
+        time.sleep(30 * 60)  # 30 minutes
 
 
-@app.route("/")
-def dashboard():
-    here = os.path.dirname(os.path.abspath(__file__))
-    for name in ["dashboard.html", os.path.join("templates","dashboard.html")]:
-        path = os.path.join(here, name)
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                return Response(f.read(), mimetype="text/html")
-    return Response(FALLBACK_HTML, mimetype="text/html")
+# ── API routes ───────────────────────────────────────────────────────────────
 
-@app.route("/api/scan")
-def api_scan():
-    return jsonify(latest_scan)
-
-@app.route("/api/scan/now")
-def api_scan_now():
-    threading.Thread(target=run_scan, daemon=True).start()
-    return jsonify({"status": "started"})
-
-@app.route("/api/top")
-def api_top():
-    # Python scanner results first, then browser-detected signals
-    python_top = latest_scan.get("top_picks", [])
-    if python_top:
-        return jsonify(python_top)
-    # Fallback: combine browser bull + bear, sort by probability
-    browser_all = _get_browser_signals("bull") + _get_browser_signals("bear")
-    browser_all.sort(key=lambda x: x.get("probability", 0), reverse=True)
-    return jsonify(browser_all[:10])
-
-@app.route("/api/bull")
-def api_bull():
-    # Python scanner results first
-    python_bull = latest_scan.get("bull_reversals", [])
-    if python_bull:
-        return jsonify(python_bull)
-    # Fallback: browser-detected bull signals
-    browser_bull = _get_browser_signals("bull")
-    if browser_bull:
-        log.info(f"Serving {len(browser_bull)} browser-detected bull signals")
-    return jsonify(browser_bull)
-
-@app.route("/api/bear")
-def api_bear():
-    # Python scanner results first
-    python_bear = latest_scan.get("bear_reversals", [])
-    if python_bear:
-        return jsonify(python_bear)
-    # Fallback: browser-detected bear signals
-    browser_bear = _get_browser_signals("bear")
-    if browser_bear:
-        log.info(f"Serving {len(browser_bear)} browser-detected bear signals")
-    return jsonify(browser_bear)
-
-@app.route("/api/status")
-def api_status():
-    return jsonify({
-        "scanning":           is_scanning,
-        "last_scan":          last_scan_time.isoformat() if last_scan_time else None,
-        "bull_count":         len(latest_scan.get("bull_reversals", [])),
-        "bear_count":         len(latest_scan.get("bear_reversals", [])),
-        "top_count":          len(latest_scan.get("top_picks", [])),
-        "browser_bull_count": len(_get_browser_signals("bull")),
-        "browser_bear_count": len(_get_browser_signals("bear")),
-        "telegram":           telegram.enabled,
-        "history":            scan_history,
-    })
-
-
-sent_browser_alerts = {}
-
-@app.route("/api/alert", methods=["POST"])
-def api_alert():
-    """
-    Called by the dashboard when it finds a high-confidence reversal.
-    NOW ALSO: stores the signal in the browser cache so /api/bear and
-    /api/bull return it — the warfare bot can then read these signals.
-    """
-    try:
-        data = request.get_json(force=True)
-        if not data:
-            return jsonify({"status": "error", "msg": "no data"}), 400
-
-        symbol   = data.get("symbol", "")
-        signal   = data.get("signal", "")
-        prob     = data.get("probability", 0)
-        price    = data.get("price", 0)
-        chg      = data.get("change_24h", 0)
-        reasons  = data.get("reasons", [])
-        targets  = data.get("targets", {})
-        stop     = data.get("stop_loss", "")
-        entry    = data.get("entry_zone", "")
-        rsi      = data.get("rsi_daily", 50)
-        vol      = data.get("volume_ratio", 1)
-        bp       = data.get("buy_pressure", 50)
-        sigs     = data.get("signals_hit", [])
-        grade    = data.get("grade", "")
-        drop     = data.get("drop_from_high", 0)
-        rise     = data.get("rise_from_low", 0)
-
-        if not symbol or not signal or prob < 40:
-            return jsonify({"status": "skipped", "msg": "below threshold"})
-
-        # ── STORE IN BROWSER CACHE (NEW) ──────────────────────────────────
-        # This makes /api/bear and /api/bull serve these signals
-        # so the warfare bot can read them even if Python scanner finds 0
-        signal_data = {
-            "symbol":        symbol,
-            "price":         price,
-            "change_24h":    chg,
-            "signal":        signal,
-            "probability":   prob,
-            "grade":         grade,
-            "signals_hit":   sigs,
-            "reasons":       reasons,
-            "drop_from_high": drop,
-            "rise_from_low": rise,
-            "rsi_daily":     rsi,
-            "volume_ratio":  vol,
-            "entry_zone":    entry,
-            "targets":       targets,
-            "stop_loss":     stop,
-            "source":        "dashboard",
-            "analyzed_at":   datetime.utcnow().isoformat(),
-        }
-
-        now_ts = datetime.utcnow().timestamp()
-        if signal == "BULL_REVERSAL":
-            browser_bull_signals[symbol] = {"data": signal_data, "cached_at": now_ts}
-            log.info(f"📗 Cached BULL signal: {symbol} {prob}%")
-        elif signal == "BEAR_REVERSAL":
-            browser_bear_signals[symbol] = {"data": signal_data, "cached_at": now_ts}
-            log.info(f"📕 Cached BEAR signal: {symbol} {prob}%")
-
-        # ── TELEGRAM DEDUP ─────────────────────────────────────────────────
-        now = datetime.utcnow()
-        key = f"{symbol}_{signal}"
-        if key in sent_browser_alerts:
-            diff = (now - sent_browser_alerts[key]).total_seconds()
-            if diff < 3600:
-                return jsonify({"status": "cached", "msg": f"cooldown {int((3600-diff)/60)}min",
-                                "symbol": symbol, "probability": prob})
-
-        sent_browser_alerts[key] = now
-        cutoff = now.timestamp() - 7200
-        for k in list(sent_browser_alerts.keys()):
-            if sent_browser_alerts[k].timestamp() < cutoff:
-                del sent_browser_alerts[k]
-
-        # Build Telegram message
-        sym    = symbol.replace("USDT", "")
-        isBull = signal == "BULL_REVERSAL"
-        stars  = "⭐⭐⭐" if prob >= 80 else "⭐⭐" if prob >= 65 else "⭐"
-
-        if isBull:
-            msg = (
-                f"🟢 *BULL REVERSAL DETECTED* {stars}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"💎 *{sym}/USDT*\n"
-                f"📊 Probability: *{prob}%* | Grade: *{grade}*\n"
-                f"💲 Price: `${price}`\n"
-                f"📈 Today: *+{chg:.2f}%*\n"
-                f"📉 Fell: *{drop:.0f}%* from recent high\n"
-                f"💪 Buy Pressure: *{bp}%* | Vol: *{vol}x*\n"
-                f"📐 RSI: *{rsi}*\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📍 Entry: `{entry}`\n"
-            )
-        else:
-            msg = (
-                f"🔴 *BEAR REVERSAL DETECTED* {stars}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"⚠️ *{sym}/USDT*\n"
-                f"📊 Probability: *{prob}%* | Grade: *{grade}*\n"
-                f"💲 Price: `${price}`\n"
-                f"📉 Today: *{chg:.2f}%*\n"
-                f"📈 Rose: *{rise:.0f}%* from recent low\n"
-                f"🐻 Sell Pressure: *{100-bp}%* | Vol: *{vol}x*\n"
-                f"📐 RSI: *{rsi}*\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📍 Entry: `{entry}`\n"
-            )
-
-        if targets.get("T1"):
-            msg += f"🎯 T1: `{targets['T1']}` | T2: `{targets.get('T2','—')}`\n"
-        if stop:
-            msg += f"🛑 Stop: `{stop}`\n"
-        if sigs:
-            msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            msg += f"🔍 *Signals:* {', '.join(sigs[:5])}\n"
-        if reasons:
-            msg += f"\n📋 *Why:*\n"
-            for r in reasons[:4]:
-                msg += f"  • {r}\n"
-
-        msg += f"\n🕐 {now.strftime('%Y-%m-%d %H:%M')} UTC"
-        msg += f"\n📊 [View Chart](https://www.tradingview.com/chart/?symbol=BINANCE:{sym}USDT.P&interval=D)"
-
-        telegram.send_message(msg)
-        log.info(f"Telegram alert sent: {symbol} {signal} {prob}%")
-        return jsonify({"status": "sent", "symbol": symbol, "probability": prob})
-
-    except Exception as e:
-        log.error(f"Alert endpoint error: {e}")
-        return jsonify({"status": "error", "msg": str(e)}), 500
-
-@app.route("/health")
+@app.route("/health", methods=["GET"])
 def health():
     return jsonify({
-        "status": "ok",
-        "time": datetime.utcnow().isoformat(),
-        "browser_bull": len(_get_browser_signals("bull")),
-        "browser_bear": len(_get_browser_signals("bear")),
+        "status":       "ok",
+        "scanned_at":   latest_scan["scanned_at"],
+        "bull_count":   len(latest_scan["bull_reversals"]),
+        "bear_count":   len(latest_scan["bear_reversals"]),
+        "browser_bull": len(browser_cache["bull"]),
+        "browser_bear": len(browser_cache["bear"]),
     })
 
-FALLBACK_HTML = '<!DOCTYPE html><html><head><meta charset=UTF-8><title>Reversal Bot PRO</title>\n<style>body{background:#02050d;color:#00ff99;font-family:monospace;padding:40px;text-align:center}\nh1{font-size:2em;margin-bottom:20px}a{color:#00bbff}\n</style></head><body>\n<h1>REVERSAL BOT PRO</h1>\n<p style="color:#7799bb">Dashboard file missing — see fix below</p>\n<br>\n<a href="/api/scan">📊 View Scan Data (JSON)</a><br><br>\n<a href="/api/top">⭐ Top Picks (JSON)</a><br><br>\n<a href="/api/status">📡 Bot Status</a><br><br>\n<a href="/api/scan/now">⚡ Trigger Scan Now</a>\n</body></html>'
 
+@app.route("/api/scan", methods=["GET"])
+def api_scan():
+    """Return the last full Python scan result."""
+    with scan_lock:
+        return jsonify({
+            "top_picks":      latest_scan["top_picks"],
+            "bull_reversals": latest_scan["bull_reversals"],
+            "bear_reversals": latest_scan["bear_reversals"],
+            "scanned_at":     latest_scan["scanned_at"],
+            "total_scanned":  latest_scan["total_scanned"],
+        })
+
+
+@app.route("/api/scan/now", methods=["GET", "POST"])
+def api_scan_now():
+    """Trigger an immediate scan in background."""
+    def _bg():
+        try: run_scan()
+        except Exception as e: logging.error(f"bg scan: {e}")
+    threading.Thread(target=_bg, daemon=True).start()
+    return jsonify({"status": "scan started"})
+
+
+@app.route("/api/top", methods=["GET"])
+def api_top():
+    """Top picks (S + A grade). Falls back to browser cache."""
+    with scan_lock:
+        data = latest_scan["top_picks"]
+
+    if not data:
+        cached = browser_cache.get("top", [])
+        if cached:
+            logging.info(f"/api/top: serving {len(cached)} browser-cached")
+            return jsonify(cached)
+        # Also try bull+bear browser cache merged
+        merged = browser_cache.get("bull", []) + browser_cache.get("bear", [])
+        merged = [x for x in merged if x.get("grade","C") in ("S","A")]
+        if merged:
+            return jsonify(merged)
+
+    return jsonify(data or [])
+
+
+@app.route("/api/bull", methods=["GET"])
+def api_bull():
+    """Bull reversal signals. Falls back to browser cache."""
+    with scan_lock:
+        data = latest_scan["bull_reversals"]
+
+    if not data:
+        cached = browser_cache.get("bull", [])
+        if cached:
+            logging.info(f"/api/bull: serving {len(cached)} browser-cached")
+            return jsonify(cached)
+
+    return jsonify(data or [])
+
+
+@app.route("/api/bear", methods=["GET"])
+def api_bear():
+    """Bear reversal signals. Falls back to browser cache."""
+    with scan_lock:
+        data = latest_scan["bear_reversals"]
+
+    if not data:
+        cached = browser_cache.get("bear", [])
+        if cached:
+            logging.info(f"/api/bear: serving {len(cached)} browser-cached")
+            return jsonify(cached)
+
+    return jsonify(data or [])
+
+
+@app.route("/api/alert", methods=["GET", "POST"])
+def api_alert():
+    """
+    Called by the dashboard JS when it detects a signal.
+    Stores the signal in the browser cache.
+    Also returns current alerts.
+    """
+    if request.method == "POST":
+        try:
+            data = request.get_json(force=True, silent=True) or {}
+            symbol    = data.get("symbol", "")
+            signal    = data.get("signal", data.get("type", ""))
+            prob      = float(data.get("probability", data.get("prob", 50)))
+            price     = float(data.get("price", 0))
+            chg       = float(data.get("change", data.get("change_24h", 0)))
+            source    = "browser_dashboard"
+
+            if symbol and prob >= 45:
+                if not symbol.endswith("USDT"):
+                    symbol += "USDT"
+
+                grade = "S" if prob >= 88 else "A" if prob >= 78 else "B" if prob >= 68 else "C"
+
+                entry = {
+                    "symbol":        symbol,
+                    "probability":   prob,
+                    "signal":        signal or ("BULL_REVERSAL" if chg < 0 else "BEAR_REVERSAL"),
+                    "grade":         grade,
+                    "price":         price,
+                    "change_24h":    chg,
+                    "volume_24h_usd": float(data.get("volume", 10_000_000)),
+                    "rsi_daily":     float(data.get("rsi", 50)),
+                    "signals_hit":   data.get("signals", []),
+                    "reasons":       data.get("reasons", []),
+                    "divergence":    data.get("divergence", None),
+                    "choch_detected": data.get("choch", False),
+                    "absorption":    data.get("absorption", False),
+                    "squeeze_score": float(data.get("squeeze", 0)),
+                    "timeframes_confirmed": data.get("timeframes", []),
+                    "volume_ratio":  1.0,
+                    "source":        source,
+                    "detected_at":   datetime.datetime.now().isoformat(),
+                }
+
+                # Route to bull or bear cache
+                sig_upper = entry["signal"].upper()
+                if "BULL" in sig_upper:
+                    # Deduplicate
+                    browser_cache["bull"] = [
+                        x for x in browser_cache["bull"] if x["symbol"] != symbol
+                    ]
+                    browser_cache["bull"].append(entry)
+                    browser_cache["bull"].sort(key=lambda x: x["probability"], reverse=True)
+                    browser_cache["bull"] = browser_cache["bull"][:30]
+                elif "BEAR" in sig_upper:
+                    browser_cache["bear"] = [
+                        x for x in browser_cache["bear"] if x["symbol"] != symbol
+                    ]
+                    browser_cache["bear"].append(entry)
+                    browser_cache["bear"].sort(key=lambda x: x["probability"], reverse=True)
+                    browser_cache["bear"] = browser_cache["bear"][:30]
+
+                if grade in ("S","A"):
+                    browser_cache["top"] = [
+                        x for x in browser_cache["top"] if x["symbol"] != symbol
+                    ]
+                    browser_cache["top"].append(entry)
+                    browser_cache["top"].sort(key=lambda x: x["probability"], reverse=True)
+
+                browser_cache["updated_at"] = datetime.datetime.now().isoformat()
+
+                total = len(browser_cache["bull"]) + len(browser_cache["bear"])
+                logging.info(f"📡 Alert: {symbol} {entry['signal']} {prob:.0f}% | cache: bull={len(browser_cache['bull'])} bear={len(browser_cache['bear'])}")
+
+                return jsonify({
+                    "status": "stored",
+                    "symbol": symbol,
+                    "grade":  grade,
+                    "total_cached": total,
+                })
+
+        except Exception as e:
+            logging.warning(f"alert POST error: {e}")
+
+    # GET — return all current alerts
+    all_alerts = browser_cache["bull"] + browser_cache["bear"]
+    all_alerts.sort(key=lambda x: x["probability"], reverse=True)
+    return jsonify(all_alerts)
+
+
+@app.route("/api/signals/push", methods=["POST"])
+def push_signals():
+    """
+    Dashboard JS posts bulk signals here every 60s.
+    Payload: { bull: [...], bear: [...], top: [...] }
+    """
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        updated = []
+
+        now_iso = datetime.datetime.now().isoformat()
+
+        for key in ("bull", "bear", "top", "candle_bull", "candle_bear"):
+            if key in data and isinstance(data[key], list):
+                # Normalize symbols
+                normalized = []
+                for item in data[key]:
+                    if isinstance(item, dict) and item.get("symbol"):
+                        sym = item["symbol"]
+                        if not sym.endswith("USDT"):
+                            sym += "USDT"
+                        item["symbol"] = sym
+                        item["source"] = "browser_dashboard"
+                        item["detected_at"] = now_iso
+                        # Ensure probability field
+                        if "probability" not in item:
+                            item["probability"] = float(
+                                item.get("prob", item.get("reversal_probability", 50))
+                            )
+                        # Ensure grade
+                        if "grade" not in item:
+                            p = item["probability"]
+                            item["grade"] = "S" if p>=88 else "A" if p>=78 else "B" if p>=68 else "C"
+                        normalized.append(item)
+
+                browser_cache[key] = normalized
+                updated.append(f"{key}={len(normalized)}")
+
+        browser_cache["updated_at"] = now_iso
+        total = len(browser_cache["bull"]) + len(browser_cache["bear"])
+
+        logging.info(f"📡 Signal push: {', '.join(updated)} | total={total}")
+
+        return jsonify({
+            "status": "ok",
+            "received": updated,
+            "total_cached": total,
+            "updated_at": now_iso,
+        })
+
+    except Exception as e:
+        logging.error(f"push_signals error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/api/signals/status", methods=["GET"])
+def signals_status():
+    """Quick check — is browser cache populated?"""
+    return jsonify({
+        "bull_count":  len(browser_cache["bull"]),
+        "bear_count":  len(browser_cache["bear"]),
+        "top_count":   len(browser_cache["top"]),
+        "updated_at":  browser_cache["updated_at"],
+        "scan_at":     latest_scan["scanned_at"],
+        "python_bull": len(latest_scan["bull_reversals"]),
+        "python_bear": len(latest_scan["bear_reversals"]),
+        "top_3_bull":  browser_cache["bull"][:3],
+        "top_3_bear":  browser_cache["bear"][:3],
+    })
+
+
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({
+        "name": "Reversal Bot Pro API",
+        "endpoints": [
+            "/api/bull", "/api/bear", "/api/top",
+            "/api/scan", "/api/scan/now",
+            "/api/alert", "/api/signals/push", "/api/signals/status",
+            "/health"
+        ]
+    })
+
+
+# ── Start ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Run Python scanner in background immediately + every 30 min
+    scanner_thread = threading.Thread(target=scan_scheduler, daemon=True)
+    scanner_thread.start()
+    logging.info("🚀 Reversal Bot Pro server starting on port 5000")
     port = int(os.getenv("PORT", 5000))
-    log.info(f"Reversal Bot Pro — port {port}")
-    log.info(f"Telegram: {'ON' if telegram.enabled else 'OFF — add TELEGRAM_TOKEN + TELEGRAM_CHAT_1 + TELEGRAM_CHAT_2'}")
-    threading.Thread(target=scheduler_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
