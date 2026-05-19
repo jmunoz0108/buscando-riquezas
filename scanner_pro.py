@@ -81,7 +81,7 @@ class ProScanner:
         # Sort by volume — higher volume = more reliable signals
         tickers.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
         
-        # Limit to top 200 for speed (these have most reliable signals anyway)
+        # Limit to top 200 for speed
         tickers = tickers[:200]
 
         log.info(f"Pro scanning {len(tickers)} coins...")
@@ -104,11 +104,11 @@ class ProScanner:
                 k4h  = self.get_klines(symbol, "4h",  60)
                 k5m  = self.get_klines(symbol, "5m",  60)
 
-                # Get funding + OI (only for coins with decent volume to save API calls)
+                # Get funding + OI
                 vol = float(ticker.get("quoteVolume", 0))
                 funding = 0.0
                 oi, prev_oi = 0, 0
-                if vol > 500_000:  # $500K+ volume
+                if vol > 500_000:
                     funding = self.get_funding_rate(symbol)
                     oi, prev_oi = self.get_open_interest_history(symbol)
                     time.sleep(0.05)
@@ -124,7 +124,7 @@ class ProScanner:
                     continue
 
                 # Add order book for top signals
-                if result["probability"] >= 70:
+                if result["probability"] >= 60:
                     ob_ratio = self.get_order_book_ratio(symbol)
                     result["order_book_ratio"] = ob_ratio
                     if ob_ratio > 1.5 and result["signal"] == "BULL_REVERSAL":
@@ -135,7 +135,7 @@ class ProScanner:
                         result["reasons"].append(f"📕 Order book {1/ob_ratio:.1f}x more asks than bids")
 
                 # Add news
-                if news_scanner and result["probability"] >= 65:
+                if news_scanner and result["probability"] >= 55:
                     coin = symbol.replace("USDT", "")
                     news = news_scanner.get_news(coin)
                     if news:
@@ -180,7 +180,7 @@ class ProScanner:
             "total_scanned": count,
             "bull_reversals": bull[:15],
             "bear_reversals": bear[:15],
-            "top_picks":     results[:10],  # Absolute best regardless of direction
+            "top_picks":     results[:10],
             "market": {
                 "sentiment": "bullish" if up > down * 1.2 else "bearish" if down > up * 1.2 else "neutral",
                 "up": up, "down": down,
